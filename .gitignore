@@ -1,0 +1,21 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Data ---
+# Processed data can always be rebuilt from raw data + code, so we don't track it.
+data/processed/*
+!data/processed/.gitkeep
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Secrets (API keys etc.) ---
+.env
