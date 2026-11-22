@@ -19,3 +19,10 @@ desktop.ini
 
 # --- Secrets (API keys etc.) ---
 .env
+
+# --- Data pipeline ---
+# Hand-exported terminal data (Bloomberg/LSEG, e.g. Baltic Dry Index) may not be redistributed.
+data/manual/
+*.duckdb
+*.duckdb.wal
+.pytest_cache/

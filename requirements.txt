@@ -3,3 +3,10 @@ numpy
 matplotlib
 statsmodels
 jupyter
+# data pipeline (src/extract.py)
+duckdb>=1.0
+requests>=2.31
+openpyxl>=3.1      # .xlsx files (World Bank, NY Fed)
+xlrd>=2.0          # .xls file (Geopolitical Risk index)
+python-dotenv>=1.0
+pytest>=8.0
