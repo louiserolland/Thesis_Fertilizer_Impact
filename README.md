@@ -18,6 +18,8 @@ src/            reusable Python code (data loading, cleaning, models)
   data_sources.py  download + parse every source, one section per provider
   database.py      DuckDB: schema, writing (upsert) and reading (monthly_panel, catalogue, sql)
   extract.py       command line entry point: runs the sources and fills the database
+  check_data.py    six data checks + overview figure (outputs/figures/data_overview.png)
+  run_pipeline.py  ONE command: tests -> download -> checks -> READY / NOT READY
   (planned)        models.py (OLS, VAR/SVAR, IRF, FEVD) · forecast.py (XGBoost) · plots.py
 tests/          offline tests of the parsers and the database (python -m pytest -q)
 outputs/
@@ -32,6 +34,16 @@ python -m venv .venv
 pip install -r requirements.txt
 copy .env.example .env          # then paste your own API keys into .env (never committed)
 ```
+
+## One command to check that everything works
+
+```bash
+python src/run_pipeline.py                 # tests -> download all -> data checks -> verdict
+python src/run_pipeline.py --no-download   # tests + data checks only (offline, a few seconds)
+python src/run_pipeline.py fred ams        # refresh only some sources
+```
+It ends with **READY**, **READY WITH WARNINGS** or **NOT READY** (and says what to fix).
+Run it after changing code, before a commit, and before estimating models on fresh data.
 
 ## Getting the data
 
@@ -63,14 +75,24 @@ df = monthly_panel(["fao_ffpi", "fao_cereals", "wb_urea", "wb_ngas_eu", "wb_bren
 | Dataset | Source | Key needed | Notes |
 |---|---|---|---|
 | FAO Food Price Index + 5 sub-indices | FAO | no | dependent variables, 2014-16=100, revised monthly |
-| Urea, DAP, TSP, phosphate rock, potash | World Bank Pink Sheet | no | $/mt; check urea quote change (Black Sea → Middle East) |
+| Urea, DAP, TSP, phosphate rock, potash | World Bank Pink Sheet | no | urea = FOB **Middle East** since 03/2022 (Black Sea before): origin price, series break |
 | Brent, WTI, natural gas US/Europe, LNG Japan | World Bank Pink Sheet | no | energy controls |
 | Maize, wheat, rice, soybeans, soy/palm oil, sugar | World Bank Pink Sheet | no | soybeans = low-nitrogen placebo |
-| Kilian global activity index, US CPI, USD REER | FRED | FRED | demand control, deflator, dollar |
+| Kilian global activity index, US CPI, USD REER | FRED | FRED | CPI Oct 2025 missing (US shutdown) -> `fred_us_cpi_filled` |
 | ONI / RONI (ENSO), US PDSI | NOAA | no | weather controls |
 | Geopolitical Risk Index | Caldara & Iacoviello (2022) | no | |
 | Global Supply Chain Pressure Index | NY Fed | no | contains the BDI among its inputs |
-| Daily transits Hormuz / Bab el-Mandeb / Suez | IMF PortWatch | no | continuous measure of the closure |
-| Fertilizer trade (HS 310210, 281410, 310530, 310540) | UN Comtrade | Comtrade | Gulf exports + mirror imports; months of reporting lag |
-| Baltic Dry Index | Bloomberg / LSEG (manual) | terminal | not redistributable |
-| Hormuz dummy | constructed | – | 1 from 2026-03 (see `src/config.py`) |
+| Daily transits Hormuz / Bab el-Mandeb / Suez | IMF PortWatch | no | from 2019 only |
+| Fertilizer trade (urea, ammonia, DAP, MAP) | UN Comtrade | Comtrade | use mirror data (importers' declarations) |
+| Illinois retail fertilizer prices (ammonia, urea, UAN, DAP, potash) | USDA AMS report 3195 | AMS | **destination** price, only free ammonia price |
+| World grain stocks-to-use (maize, wheat, rice; world & ex-China) | USDA FAS PSD | no | annual; market year Y used in year Y+1 (no look-ahead) |
+| US fuel ethanol & biodiesel production | EIA Monthly Energy Review | no | biofuel channel control |
+| Baltic Dry Index, urea futures (ME/Brazil/NOLA/Egypt), CBOT grains | Bloomberg / LSEG (manual CSV) | terminal | `data/manual/`, daily kept in `market_daily` |
+| Hormuz dummy | constructed | – | 1 from 2026-03 |
+| Hormuz intensity, traffic ratio | derived from PortWatch | – | intensity 0 before 2026-03, then 1 - transits/pre-war normal |
+| Imports from inside vs outside (Oman) the strait | derived from Comtrade | – | thousand t; empty after the last month all importers reported |
+
+### Manual files (terminal exports)
+CSV with two columns `date,value`, saved in `data/manual/` with these names (see `MANUAL_SERIES` in `src/config.py`):
+`bdi.csv`, `urea_me_futures.csv`, `urea_brazil_futures.csv`, `urea_nola_futures.csv`, `urea_egypt_futures.csv`,
+`corn_futures.csv`, `wheat_futures.csv`, `soybean_futures.csv`. Then run `python src/extract.py manual`.

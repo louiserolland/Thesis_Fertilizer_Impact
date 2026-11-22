@@ -8,13 +8,42 @@ Usage (from the repository root):
 
 One failing source never stops the others: the error is printed and written
 to the extraction_log table, and you can rerun just that source.
+After the downloads, the derived variables (CPI gap, Hormuz intensity,
+inside/outside-strait imports) are always recomputed from the database.
 """
 import argparse
 import traceback
 from datetime import datetime
 
 import database
-from data_sources import SOURCES
+from data_sources import DERIVED, SOURCES
+
+
+def run(names=None, verbose=True) -> dict:
+    """Download the given sources (default: all), then recompute the derived variables.
+    Returns {source: 'ok' | 'error: ...'} so other scripts (run_pipeline.py) can use it."""
+    names = [n for n in (names or list(SOURCES)) if n not in DERIVED]
+    if unknown := set(names) - set(SOURCES):
+        raise SystemExit(f"Unknown source(s): {unknown}. Use --list.")
+    results = {}
+    with database.connect() as con:
+        for name, func in [*((n, SOURCES[n]) for n in names), *DERIVED.items()]:
+            started = datetime.now()
+            print(f"-> {name}")
+            try:
+                result = func(con) if name in DERIVED else func()     # derived: always last
+                n = database.save_result(con, result)
+                database.log_run(con, name, started, "ok", n)
+                print(f"   ok: {n} rows")
+                results[name] = "ok"
+            except Exception as e:
+                database.log_run(con, name, started, "error", 0, f"{e}\n{traceback.format_exc()}")
+                print(f"   ERROR: {e}")
+                results[name] = f"error: {e}"
+    if verbose:
+        print("\nDatabase content:")
+        print(database.catalogue().to_string(index=False))
+    return results
 
 
 def main():
@@ -23,26 +52,8 @@ def main():
     p.add_argument("--list", action="store_true")
     args = p.parse_args()
     if args.list:
-        return print("\n".join(SOURCES))
-
-    names = args.sources or list(SOURCES)
-    if unknown := set(names) - set(SOURCES):
-        raise SystemExit(f"Unknown source(s): {unknown}. Use --list.")
-
-    with database.connect() as con:
-        for name in names:
-            started = datetime.now()
-            print(f"-> {name}")
-            try:
-                n = database.save_result(con, SOURCES[name]())
-                database.log_run(con, name, started, "ok", n)
-                print(f"   ok: {n} rows")
-            except Exception as e:
-                database.log_run(con, name, started, "error", 0, f"{e}\n{traceback.format_exc()}")
-                print(f"   ERROR: {e}")
-
-    print("\nDatabase content:")
-    print(database.catalogue().to_string(index=False))
+        return print("\n".join([*SOURCES, *DERIVED]))
+    run(args.sources)
 
 
 if __name__ == "__main__":

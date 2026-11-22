@@ -7,6 +7,7 @@ If a provider changes its file format, one of these tests (or the real run)
 will tell you which parser to adapt.
 """
 import io
+import zipfile
 import sys
 from pathlib import Path
 
@@ -78,7 +79,7 @@ def test_enso_and_pdsi_parsers():
 
 
 def test_gscpi_parser():
-    rows = [["GSCPI data"], [None], ["Date", "GSCPI"], ["2000-01-31", 0.3], ["2000-02-29", -0.1]]
+    rows = [["GSCPI data", None], [None, None], ["Date", "GSCPI"], ["2000-01-31", 0.3], ["2000-02-29", -0.1]]
     buf = io.BytesIO()
     pd.DataFrame(rows).to_excel(buf, sheet_name="GSCPI Monthly Data", header=False, index=False)
     out = ds.parse_gscpi(buf.getvalue())
@@ -113,3 +114,118 @@ def test_upsert_is_idempotent_and_pivot(tmp_db):
 
     wide = database.monthly_panel()
     assert list(wide.columns) == ["a", "b"] and wide.loc["2000-02-01", "a"] == 2.5
+
+
+def test_upsert_handles_duplicates_in_one_batch(tmp_db):
+    obs = pd.DataFrame({"series_id": ["a", "a"], "date": pd.to_datetime(["2000-01-01"] * 2).date,
+                        "value": [1.0, 9.0]})
+    with database.connect() as con:
+        database.upsert(con, "observations", obs)
+        assert con.execute("SELECT value FROM observations").fetchall() == [(9.0,)]
+
+
+# ---------------------------------------------------------------------------
+# New sources (AMS, PSD, EIA, manual daily) and derived variables
+# ---------------------------------------------------------------------------
+def test_ams_parser_finds_prices_in_nested_json():
+    payload = [{"reportSection": "Report Header", "results": [{"report_title": "Illinois Production Cost"}]},
+               {"reportSection": "Report Detail", "results": [
+                   {"report_end_date": "03/20/2026", "commodity": "Fertilizer", "class": "Urea 46-0-0", "avg_price": "822.50"},
+                   {"report_end_date": "03/20/2026", "commodity": "Fertilizer", "class": "Anhydrous Ammonia", "avg_price": "1,050.00"},
+                   {"report_end_date": "03/06/2026", "commodity": "Fertilizer", "class": "Urea 46-0-0", "avg_price": "800.00"},
+                   {"report_end_date": "03/20/2026", "commodity": "Diesel", "class": "Off-road", "avg_price": "3.10"}]}]
+    out = ds.parse_ams([payload]).set_index("series_id")["value"]
+    assert out["ams_il_urea"] == pytest.approx(811.25)          # average of the two March reports
+    assert out["ams_il_ammonia"] == 1050.0
+    assert "Diesel" not in out.index
+
+
+def test_ams_parser_explains_unknown_layout():
+    with pytest.raises(RuntimeError, match="Keys seen"):
+        ds.parse_ams([{"results": [{"some_date": "x", "foo": 1}]}])
+
+
+def test_psd_stocks_to_use_world_and_exchina():
+    rows = []
+    for country, es, dc in [("China", 200, 300), ("United States", 50, 300)]:
+        rows += [{"Commodity_Description": "Corn", "Country_Name": country, "Market_Year": 2020,
+                  "Attribute_Description": "Ending Stocks", "Value": es},
+                 {"Commodity_Description": "Corn", "Country_Name": country, "Market_Year": 2020,
+                  "Attribute_Description": "Domestic Consumption", "Value": dc},
+                 {"Commodity_Description": "Corn", "Country_Name": country, "Market_Year": 2020,
+                  "Attribute_Description": "Production", "Value": 999}]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("psd_grains_pulses.csv", pd.DataFrame(rows).to_csv(index=False))
+    out = ds.parse_psd(buf.getvalue())
+    jan21 = out[out["date"] == pd.Timestamp("2021-01-01").date()].set_index("series_id")["value"]
+    assert jan21["psd_stu_maize_world"] == pytest.approx(250 / 600)    # market year 2020 shown in 2021
+    assert jan21["psd_stu_maize_exchina"] == pytest.approx(50 / 300)
+    assert out["date"].min() == pd.Timestamp("2021-01-01").date()
+
+
+def test_eia_parser_selects_by_code_and_drops_annual_rows():
+    csv = ("MSN,YYYYMM,Value,Column_Order,Description,Unit\n"
+           "ENPRPUS,202601,33738,1,Fuel Ethanol Production,Thousand Barrels\n"
+           "ENPRMUS,202601,1417,2,Fuel Ethanol Production,Million Gallons\n"
+           "ENPRBUS,202601,119.9,3,Fuel Ethanol Production,Trillion Btu\n"
+           "ENPRPUS,202602,31000,1,Fuel Ethanol Production,Thousand Barrels\n"
+           "ENPRPUS,202613,64738,1,Fuel Ethanol Production,Thousand Barrels\n").encode()
+    out = ds.parse_eia(csv, {"ENPRPUS": ("eia_ethanol_prod", "x")})
+    assert out["value"].tolist() == [33738, 31000]          # same description, other units ignored
+
+
+def test_manual_daily_to_monthly(tmp_path):
+    f = tmp_path / "x.csv"
+    f.write_text("date,value\n2026-02-26,490\n2026-02-27,495\n2026-03-02,600\n2026-03-02,610\n")
+    d = ds.parse_manual_daily(f, "fut_urea_me")
+    assert len(d) == 3                                                # duplicate day removed
+    m = ds.to_monthly_mean(d).set_index("date")["value"]
+    assert m[pd.Timestamp("2026-02-01").date()] == 492.5
+
+
+def test_derive_cpi_fills_gap():
+    obs = pd.DataFrame({"series_id": "fred_us_cpi", "value": [100.0, 102.01],
+                        "date": pd.to_datetime(["2025-09-01", "2025-11-01"]).date})
+    out = ds.derive_cpi(obs).set_index("date")["value"]
+    assert out[pd.Timestamp("2025-10-01").date()] == pytest.approx(101.0, abs=1e-6)   # geometric midpoint
+
+
+def test_derive_hormuz_intensity(monkeypatch):
+    monkeypatch.setattr(config, "START_DATE", "2018-11-01")
+    months = pd.date_range("2019-01-01", "2026-03-01", freq="MS")
+    vals = [50.0] * (len(months) - 13) + [80.0] * 12 + [4.0]        # 2019 traffic lower than baseline
+    obs = pd.DataFrame({"series_id": "pw_hormuz_total", "date": months.date, "value": vals})
+    out = ds.derive_hormuz_intensity(obs)
+    s = out[out.series_id == "hormuz_intensity"].set_index("date")["value"]
+    assert s[pd.Timestamp("2026-03-01").date()] == pytest.approx(0.95)
+    assert s[pd.Timestamp("2019-06-01").date()] == 0.0             # low traffic before closure != disruption
+    assert s[pd.Timestamp("2018-11-01").date()] == 0.0             # starts at START_DATE
+    r = out[out.series_id == "hormuz_traffic_ratio"].set_index("date")["value"]
+    assert r[pd.Timestamp("2019-06-01").date()] == pytest.approx(50 / 80)
+
+
+def test_monthly_panel_real_with_start_date(tmp_db):
+    months = pd.date_range("2014-01-01", "2026-02-01", freq="MS")
+    obs = pd.concat([
+        pd.DataFrame({"series_id": "fred_us_cpi_filled", "date": months.date, "value": 100.0}),
+        pd.DataFrame({"series_id": "wb_urea", "date": months.date, "value": 400.0})])
+    with database.connect() as con:
+        database.upsert(con, "observations", obs)
+    df = database.monthly_panel(["wb_urea"], start="2026-01-01", real=True)
+    assert list(df.columns) == ["wb_urea"] and df["wb_urea"].tolist() == [400.0, 400.0]
+
+
+def test_derive_strait_imports_inside_outside_and_cutoff():
+    def row(rep, par, per, kg, hs="310210"):
+        return {"period": pd.Timestamp(per), "reporter_code": rep, "partner_code": par, "flow": "M",
+                "hs_code": hs, "net_weight_kg": kg}
+    trade = pd.DataFrame([row(699, 634, "2026-02-01", 100e6), row(699, 512, "2026-02-01", 50e6),
+                          row(699, 512, "2026-03-01", 60e6), row(699, 634, "2026-04-01", 10e6),
+                          *[row(r, 682, "2026-03-01", 1e6) for r in (76, 842, 36, 764)]])
+    out = ds.derive_strait_imports(trade)
+    s = out.set_index(["series_id", "date"])["value"]
+    assert s[("ct_urea_imports_inside_kt", pd.Timestamp("2026-02-01").date())] == 100
+    assert s[("ct_urea_imports_outside_kt", pd.Timestamp("2026-03-01").date())] == 60
+    assert s[("ct_urea_imports_inside_kt", pd.Timestamp("2026-03-01").date())] == 4   # Saudi -> inside
+    assert pd.Timestamp("2026-04-01").date() not in set(out["date"])                  # after common cutoff

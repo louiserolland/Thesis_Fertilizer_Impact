@@ -10,8 +10,12 @@ Structure of this file (search for "====" to jump between sections):
     5. Research indices    Geopolitical Risk, NY Fed GSCPI          (controls)
     6. IMF PortWatch       daily ship transits through Hormuz etc.  (shock intensity)
     7. UN Comtrade         monthly fertilizer trade flows           (physical supply)
-    8. Manual + dummy      Baltic Dry Index file, Hormuz dummy
-    9. SOURCES registry    name -> extract function (used by extract.py)
+    8. Manual + dummy      terminal exports (BDI, futures), Hormuz dummy
+    9. USDA AMS            Illinois retail fertilizer prices        (destination price, ammonia)
+   10. USDA PSD            world grain stocks-to-use                (market tightness)
+   11. EIA                 US ethanol & biodiesel production        (biofuel channel control)
+   12. Derived             CPI gap, Hormuz intensity, inside/outside-strait imports
+   13. Registry            name -> function (used by extract.py)
 
 Every source follows the same pattern:
     parse_xxx(raw_bytes)  -> pure function, turns a file into a tidy DataFrame (tested offline)
@@ -24,9 +28,11 @@ import io
 import json
 import re
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -42,10 +48,10 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (thesis data pipeline; University of St. G
 # (some sites, e.g. FAO and the World Bank, block the default python User-Agent)
 
 
-def session() -> requests.Session:
+def session(retries: int = 4) -> requests.Session:
     """HTTP session that retries automatically (servers sometimes fail once)."""
     s = requests.Session()
-    retry = Retry(total=4, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    retry = Retry(total=retries, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update(HEADERS)
     return s
@@ -155,7 +161,7 @@ def _norm(x) -> str:
 
 
 def parse_worldbank(content: bytes) -> pd.DataFrame:
-    raw = pd.read_excel(io.BytesIO(content), sheet_name="Monthly Prices", header=None)
+    raw = pd.read_excel(io.BytesIO(content), sheet_name="Monthly Prices", header=None, engine="calamine")
     name_row = next(i for i in range(min(20, len(raw)))
                     if any(_norm(v) == "crude oil, brent" for v in raw.iloc[i]))
     names = [_norm(v) for v in raw.iloc[name_row]]
@@ -274,14 +280,14 @@ def extract_noaa() -> SourceResult:
 #   (incl. Baltic Dry Index) + PMI delivery times: free proxy for the BDI.
 # ============================================================================
 def parse_gpr(content: bytes) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(content))                    # .xls -> needs 'xlrd'
+    df = pd.read_excel(io.BytesIO(content), engine="calamine")     # .xls -> needs 'xlrd'
     date_col = next(c for c in df.columns if str(c).lower() in ("month", "date"))
     df[date_col] = to_month_start(df[date_col])
     return long_frame(df, date_col, config.GPR_COLUMNS)
 
 
 def parse_gscpi(content: bytes) -> pd.DataFrame:
-    book = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+    book = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None, engine="calamine")
     sheet = next((s for n, s in book.items() if "monthly" in n.lower()), next(iter(book.values())))
     hdr = next(i for i in range(min(15, len(sheet)))
                if any(str(v).strip().upper() == "GSCPI" for v in sheet.iloc[i]))
@@ -439,18 +445,24 @@ def extract_comtrade() -> SourceResult:
 
 
 # ============================================================================
-# 8. MANUAL FILES + CONSTRUCTED VARIABLES
-# * Data without a free API (Baltic Dry Index: Bloomberg 'BDIY Index'):
-#   CSV 'date,value' in data/manual/ (daily is fine -> averaged to monthly).
+# 8. MANUAL FILES + HORMUZ DUMMY
+# * Data without a free API, exported from a terminal (Bloomberg / LSEG):
+#   CSV 'date,value' in data/manual/, daily or monthly. Daily values go to the
+#   table market_daily (for an event study) AND are averaged to monthly.
 # * Hormuz dummy D_t (start date in config.HORMUZ_START).
 # ============================================================================
-def parse_manual(path, series_id) -> pd.DataFrame:
+def parse_manual_daily(path, series_id) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = [c.strip().lower() for c in df.columns]
-    df["date"] = to_month_start(pd.to_datetime(df["date"], errors="coerce"))
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    m = df.dropna().groupby("date", as_index=False)["value"].mean()
-    return m.assign(series_id=series_id)[["series_id", "date", "value"]]
+    df = df.dropna(subset=["date", "value"]).drop_duplicates("date", keep="last")
+    return df.assign(series_id=series_id)[["series_id", "date", "value"]]
+
+
+def to_monthly_mean(daily: pd.DataFrame) -> pd.DataFrame:
+    m = daily.assign(date=to_month_start(daily["date"])).groupby(["series_id", "date"], as_index=False)["value"].mean()
+    return m[["series_id", "date", "value"]]
 
 
 def hormuz_dummy() -> pd.DataFrame:
@@ -460,22 +472,288 @@ def hormuz_dummy() -> pd.DataFrame:
 
 
 def extract_manual() -> SourceResult:
-    frames = [hormuz_dummy()]
+    monthly, daily = [hormuz_dummy()], []
     meta = [SeriesMeta("dummy_hormuz", f"Hormuz closure dummy (1 from {config.HORMUZ_START})",
                        "constructed", "0/1", "M")]
     config.MANUAL_DIR.mkdir(parents=True, exist_ok=True)
     for filename, (sid, desc, unit) in config.MANUAL_SERIES.items():
         path = config.MANUAL_DIR / filename
         if not path.exists():
-            print(f"  [manual] {filename} not found in {config.MANUAL_DIR} -> skipped")
+            print(f"  [manual] {filename} not found -> skipped")
             continue
-        frames.append(parse_manual(path, sid))
+        d = parse_manual_daily(path, sid)
+        daily.append(d)
+        monthly.append(to_monthly_mean(d))
         meta.append(SeriesMeta(sid, desc, "manual file", unit, "M", filename))
+    tables = {"market_daily": pd.concat(daily, ignore_index=True)} if daily else {}
+    return SourceResult(observations=filter_start(pd.concat(monthly, ignore_index=True)), meta=meta, tables=tables)
+
+
+# ============================================================================
+# 9. USDA AMS - ILLINOIS PRODUCTION COST REPORT (MyMarketNews / MARS API)
+# Retail fertilizer prices paid by Illinois farmers, every two weeks:
+# a DESTINATION price (what buyers pay) and the only free ammonia price.
+# Auth: the API key is the user name of HTTP basic auth, password empty.
+# The API serves max ~180 days per request -> we loop over 6-month windows.
+# The JSON layout is not fully documented, so the parser searches every record
+# for a date, a product description and an average price.
+# ============================================================================
+AMS_DATE_KEYS = ("report_end_date", "report_begin_date", "report_date", "published_date")
+AMS_PRICE_KEYS = ("avg_price", "price_avg", "wtd_avg_price", "weighted_avg", "avg", "price")
+AMS_TEXT_KEYS = ("commodity", "class", "variety", "grade", "product", "item", "description", "category", "type")
+
+
+def _walk_records(obj):
+    """Yield every dict inside a nested JSON structure."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_records(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_records(v)
+
+
+def parse_ams(payloads: list) -> pd.DataFrame:
+    rows, seen_keys = [], set()
+    for payload in payloads:
+        for rec in _walk_records(payload):
+            keys = {k.lower(): k for k in rec}
+            seen_keys |= set(keys)
+            dkey = next((keys[k] for k in AMS_DATE_KEYS if k in keys), None)
+            pkey = next((keys[k] for k in AMS_PRICE_KEYS if k in keys), None)
+            if not dkey or not pkey:
+                continue
+            text = " ".join(str(rec[keys[k]]) for k in AMS_TEXT_KEYS if k in keys).lower()
+            sid = next((s for word, (s, _) in config.AMS_PRODUCTS.items() if word in text), None)
+            price = pd.to_numeric(str(rec[pkey]).replace(",", "").replace("$", ""), errors="coerce")
+            if sid and pd.notna(price):
+                rows.append({"series_id": sid, "date": pd.to_datetime(rec[dkey], errors="coerce"), "value": price})
+    if not rows:
+        raise RuntimeError("AMS: no price records recognised. Keys seen in the JSON: "
+                           f"{sorted(seen_keys)[:60]} -> adapt AMS_*_KEYS in data_sources.py")
+    df = pd.DataFrame(rows).dropna(subset=["date"])
+    df["date"] = df["date"].dt.date
+    return to_monthly_mean(df.groupby(["series_id", "date"], as_index=False)["value"].mean())
+
+
+def extract_ams() -> SourceResult:
+    if not config.AMS_API_KEY:
+        raise RuntimeError("AMS_API_KEY missing in .env (free account: https://mymarketnews.ams.usda.gov)")
+    s, auth = session(retries=1), (config.AMS_API_KEY, "")
+
+    # 1) quick test with ONE report: checks the key and shows the JSON layout
+    print("  [ams] testing the key with the latest report ...", flush=True)
+    r = s.get(config.AMS_URL, params={"lastReports": 1, "allSections": "true"}, auth=auth, timeout=60)
+    if r.status_code in (401, 403):
+        raise RuntimeError(f"AMS refused the key (HTTP {r.status_code}): check AMS_API_KEY in .env")
+    r.raise_for_status()
+    archive(r.content, "ams", "latest_report.json")
+    parse_ams([r.json()])                  # raises a clear error if the layout is unknown
+    print("  [ams] key OK, layout recognised", flush=True)
+
+    # 2) history in 6-month windows (the API limits the date range per request)
+    payloads, failures = [], 0
+    start, end = pd.Timestamp(config.AMS_START), pd.Timestamp.today()
+    while start < end:
+        stop = min(start + pd.DateOffset(days=179), end)
+        print(f"  [ams] {start:%Y-%m-%d} -> {stop:%Y-%m-%d} ...", end=" ", flush=True)
+        try:
+            r = s.get(config.AMS_URL, auth=auth, timeout=60,
+                      params={"q": f"report_begin_date={start:%m/%d/%Y}:{stop:%m/%d/%Y}", "allSections": "true"})
+            r.raise_for_status()
+            payloads.append(r.json())
+            archive(r.content, "ams", f"illinois_{start:%Y%m%d}.json")
+            print("ok", flush=True)
+            failures = 0
+        except Exception as e:
+            failures += 1
+            print(f"failed ({type(e).__name__})", flush=True)
+            if failures >= 3:
+                print("  [ams] 3 failures in a row -> stopping, keeping what was downloaded", flush=True)
+                break
+        start = stop + pd.Timedelta(days=1)
+    if not payloads:
+        raise RuntimeError("AMS: no window could be downloaded (server slow or down) - try again later")
+    obs = parse_ams(payloads)
+    print(f"  [ams] data from {obs['date'].min()} to {obs['date'].max()}")
+    names = {sid: desc for sid, desc in config.AMS_PRODUCTS.values()}
+    meta = [SeriesMeta(sid, names[sid], "USDA AMS (report 3195)", "$/short ton", "M", "3195")
+            for sid in sorted(obs["series_id"].unique())]
+    return SourceResult(observations=obs, meta=meta)
+
+
+# ============================================================================
+# 10. USDA FAS PSD - WORLD GRAIN STOCKS-TO-USE
+# Stocks-to-use = ending stocks / domestic consumption, summed over countries.
+# Low stocks -> the same shock moves prices more (storage theory, Wright 2011).
+# "ex-China" version: China holds a large share of world stocks that are not
+# available to the world market, so analysts often exclude it.
+# Timing (avoid look-ahead bias!): the ratio of marketing year Y is assigned
+# to the 12 months of calendar year Y+1, i.e. it is only used once known.
+# Note: the bulk file holds the LATEST estimates, not the real-time vintages.
+# ============================================================================
+def parse_psd(content: bytes) -> pd.DataFrame:
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
+        df = pd.read_csv(z.open(name))
+    df = df[df["Commodity_Description"].isin(config.PSD_COMMODITIES)
+            & df["Attribute_Description"].isin(["Ending Stocks", "Domestic Consumption"])]
+    frames = []
+    for label, sub in {"world": df, "exchina": df[df["Country_Name"] != "China"]}.items():
+        g = sub.groupby(["Commodity_Description", "Market_Year", "Attribute_Description"])["Value"].sum().unstack()
+        ratio = (g["Ending Stocks"] / g["Domestic Consumption"]).rename("value").reset_index()
+        for _, r in ratio.iterrows():
+            crop = config.PSD_COMMODITIES[r["Commodity_Description"]]
+            for m in range(1, 13):
+                frames.append({"series_id": f"psd_stu_{crop}_{label}",
+                               "date": pd.Timestamp(int(r["Market_Year"]) + 1, m, 1).date(), "value": r["value"]})
+    out = pd.DataFrame(frames)
+    return out[out["date"] <= pd.Timestamp.today().date()]
+
+
+def extract_psd() -> SourceResult:
+    obs = filter_start(parse_psd(download(config.PSD_URL, "psd", "psd_grains_pulses_csv.zip", timeout=300)))
+    meta = [SeriesMeta(sid, f"Stocks-to-use ratio {sid.split('_')[2]} ({sid.split('_')[3]}), market year Y shown in year Y+1",
+                       "USDA FAS PSD", "ratio", "M", "Ending Stocks / Domestic Consumption")
+            for sid in sorted(obs["series_id"].unique())]
+    return SourceResult(observations=obs, meta=meta)
+
+
+# ============================================================================
+# 11. EIA MONTHLY ENERGY REVIEW - BIOFUEL PRODUCTION (US)
+# Oil shock -> more demand for ethanol (maize) and biodiesel (vegetable oils):
+# a channel to food prices that has NOTHING to do with fertilizer -> control.
+# CSV columns: MSN, YYYYMM, Value, Column_Order, Description, Unit.
+# YYYYMM with month "13" = annual total -> dropped.
+# ============================================================================
+def parse_eia(content: bytes, wanted: dict) -> pd.DataFrame:
+    """wanted = {MSN code: (series_id, description)}. Selection by exact code (see config)."""
+    df = pd.read_csv(io.BytesIO(content), dtype={"YYYYMM": str, "MSN": str})
+    df = df[~df["YYYYMM"].str.endswith("13")]
+    frames, missing = [], []
+    for msn, (sid, _) in wanted.items():
+        sub = df[df["MSN"] == msn]
+        if sub.empty:
+            missing.append(msn)
+            continue
+        frames.append(pd.DataFrame({
+            "series_id": sid,
+            "date": pd.to_datetime(sub["YYYYMM"], format="%Y%m").dt.date,
+            "value": pd.to_numeric(sub["Value"], errors="coerce")}))
+    if missing:
+        codes = df[["MSN", "Description", "Unit"]].drop_duplicates().to_string(index=False)
+        print(f"  [eia] WARNING codes not found: {missing}. Available:\n{codes}")
+    return pd.concat(frames, ignore_index=True).dropna() if frames else pd.DataFrame(columns=["series_id", "date", "value"])
+
+
+def extract_eia() -> SourceResult:
+    frames, meta = [], []
+    for table, wanted in config.EIA_SERIES.items():
+        content = download(config.EIA_MER_URL.format(table=table), "eia", f"MER_{table}.csv")
+        obs = parse_eia(content, wanted)
+        frames.append(obs)
+        units = pd.read_csv(io.BytesIO(content), dtype={"MSN": str}).drop_duplicates("MSN").set_index("MSN")["Unit"]
+        for msn, (sid, desc) in wanted.items():
+            if sid in set(obs["series_id"]):
+                meta.append(SeriesMeta(sid, desc, "EIA Monthly Energy Review", str(units.get(msn, "")), "M", msn))
     return SourceResult(observations=filter_start(pd.concat(frames, ignore_index=True)), meta=meta)
 
 
 # ============================================================================
-# 9. REGISTRY — to add a source: write parse_xxx + extract_xxx above, add one line here
+# 12. DERIVED VARIABLES - computed from what is already in the database
+# (run automatically after the downloads; no internet needed)
+# a) US CPI with the missing October 2025 filled (BLS did not publish it
+#    because of the government shutdown): log-linear interpolation.
+# b) Hormuz disruption intensity: 0 before the closure, then 1 - transits /
+#    pre-war normal, in [0, 1] -> a dummy that also measures HOW closed it is.
+#    Setting it to 0 before March 2026 ASSUMES no earlier closure (state it).
+# c) Fertilizer imports of the big importers from Gulf producers INSIDE vs
+#    OUTSIDE (Oman) the strait, in thousand tonnes. Months after the latest
+#    month reported by ALL importers are left empty (not zero!).
+# ============================================================================
+def derive_cpi(obs: pd.DataFrame) -> pd.DataFrame:
+    s = obs[obs["series_id"] == "fred_us_cpi"].set_index("date")["value"]
+    s.index = pd.to_datetime(s.index)
+    s = s.asfreq("MS")
+    filled = np.exp(np.log(s).interpolate(method="linear"))
+    return pd.DataFrame({"series_id": "fred_us_cpi_filled", "date": filled.index.date, "value": filled.values})
+
+
+def derive_hormuz_intensity(obs: pd.DataFrame) -> pd.DataFrame:
+    """
+    hormuz_traffic_ratio : transits / pre-war normal (2019 onwards, raw, for plots)
+    hormuz_intensity     : 0 before the closure; afterwards 1 - ratio, in [0, 1]
+                           -> a 'dummy with a magnitude' (2000 onwards).
+    Before 2026 the ratio moves for normal reasons (traffic growth, seasons),
+    which must NOT be read as disruption -> intensity is 0 before HORMUZ_START.
+    """
+    s = obs[obs["series_id"] == "pw_hormuz_total"].set_index("date")["value"].sort_index()
+    s.index = pd.to_datetime(s.index)
+    lo, hi = (pd.Timestamp(d) for d in config.HORMUZ_BASELINE)
+    ratio = s / s.loc[lo:hi].mean()
+    months = pd.date_range(config.START_DATE, s.index.max(), freq="MS")
+    closed = months >= pd.Timestamp(config.HORMUZ_START)
+    intensity = pd.Series(0.0, index=months)
+    intensity[closed] = (1 - ratio.reindex(months[closed])).clip(0, 1).values
+    return pd.concat([
+        pd.DataFrame({"series_id": "hormuz_traffic_ratio", "date": ratio.index.date, "value": ratio.values}),
+        pd.DataFrame({"series_id": "hormuz_intensity", "date": months.date, "value": intensity.values}),
+    ], ignore_index=True).dropna()
+
+
+def derive_strait_imports(trade: pd.DataFrame) -> pd.DataFrame:
+    if trade is None or trade.empty:
+        return pd.DataFrame(columns=["series_id", "date", "value"])
+    m = trade[(trade["flow"] == "M") & trade["partner_code"].isin(config.GULF)
+              & trade["reporter_code"].isin(config.BIG_IMPORTERS)].copy()
+    m["period"] = pd.to_datetime(m["period"])
+    cutoff = m.groupby("reporter_code")["period"].max().min()       # last month ALL importers reported
+    m = m[m["period"] <= cutoff]
+    m["side"] = np.where(m["partner_code"].isin(config.OUTSIDE_STRAIT), "outside", "inside")
+    frames = []
+    for hs, name in config.TRADE_PRODUCTS.items():
+        sub = m[m["hs_code"] == hs]
+        g = sub.groupby(["period", "side"])["net_weight_kg"].sum().unstack(fill_value=0.0) / 1e6
+        months = pd.date_range(m["period"].min(), cutoff, freq="MS")
+        g = g.reindex(months, fill_value=0.0)
+        for side in ("inside", "outside"):
+            vals = g[side] if side in g else pd.Series(0.0, index=months)
+            frames.append(pd.DataFrame({"series_id": f"ct_{name}_imports_{side}_kt",
+                                        "date": months.date, "value": vals.values}))
+    return pd.concat(frames, ignore_index=True)
+
+
+def derive_all(con) -> SourceResult:
+    obs = con.execute("SELECT series_id, date, value FROM observations").df()
+    obs["date"] = pd.to_datetime(obs["date"]).dt.date
+    trade = con.execute("SELECT * FROM trade_flows").df()
+    frames, meta = [], []
+    if "fred_us_cpi" in set(obs["series_id"]):
+        frames.append(derive_cpi(obs))
+        meta.append(SeriesMeta("fred_us_cpi_filled", "US CPI, Oct 2025 gap filled (log-linear)", "derived",
+                               "index 1982-84=100", "M", "fred_us_cpi"))
+    if "pw_hormuz_total" in set(obs["series_id"]):
+        frames.append(derive_hormuz_intensity(obs))
+        meta += [SeriesMeta("hormuz_intensity", f"Hormuz disruption intensity: 0 before {config.HORMUZ_START}, "
+                            "then 1 - transits/pre-war normal", "derived", "0-1", "M", "pw_hormuz_total"),
+                 SeriesMeta("hormuz_traffic_ratio", "Hormuz transits / pre-war normal (12 months before closure)",
+                            "derived", "ratio", "M", "pw_hormuz_total")]
+    strait = derive_strait_imports(trade)
+    if not strait.empty:
+        frames.append(strait)
+        for sid in sorted(strait["series_id"].unique()):
+            meta.append(SeriesMeta(sid, f"Imports of {', '.join(config.BIG_IMPORTERS.values())} from Gulf producers "
+                                        f"{'outside (Oman)' if 'outside' in sid else 'inside'} the strait",
+                                   "derived (UN Comtrade mirror)", "thousand t", "M", "trade_flows"))
+    if not frames:
+        raise RuntimeError("nothing to derive yet: run the downloads first")
+    return SourceResult(observations=pd.concat(frames, ignore_index=True), meta=meta)
+
+
+# ============================================================================
+# 13. REGISTRY — to add a source: write parse_xxx + extract_xxx above, add one line here
+# SOURCES download data; DERIVED compute from the database (run after SOURCES).
 # ============================================================================
 SOURCES = {
     "fao": extract_fao,
@@ -486,5 +764,9 @@ SOURCES = {
     "gscpi": extract_gscpi,
     "portwatch": extract_portwatch,
     "comtrade": extract_comtrade,
+    "ams": extract_ams,
+    "psd": extract_psd,
+    "eia": extract_eia,
     "manual": extract_manual,
 }
+DERIVED = {"derived": derive_all}

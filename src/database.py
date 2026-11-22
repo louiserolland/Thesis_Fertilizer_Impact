@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS trade_flows (
     retrieved_at TIMESTAMP,
     PRIMARY KEY (period, reporter_code, partner_code, flow, hs_code)
 );
+CREATE TABLE IF NOT EXISTS market_daily (
+    series_id VARCHAR, date DATE, value DOUBLE, retrieved_at TIMESTAMP,
+    PRIMARY KEY (series_id, date)                  -- daily terminal exports (futures, BDI)
+);
 CREATE TABLE IF NOT EXISTS extraction_log (
     source VARCHAR, started_at TIMESTAMP, finished_at TIMESTAMP,
     status VARCHAR, n_rows INTEGER, message VARCHAR
@@ -91,6 +95,12 @@ def upsert(con, table: str, df: pd.DataFrame) -> int:
     if "retrieved_at" in cols_db and "retrieved_at" not in df.columns:
         df["retrieved_at"] = datetime.now()
     cols = [c for c in cols_db if c in df.columns]
+    # the same primary key twice in ONE batch makes DuckDB refuse the insert -> keep the last one
+    pk = [r[0] for r in con.execute(
+        "SELECT unnest(constraint_column_names) FROM duckdb_constraints() "
+        "WHERE table_name = ? AND constraint_type = 'PRIMARY KEY'", [table]).fetchall()]
+    if pk:
+        df = df.drop_duplicates(subset=pk, keep="last")
     con.register("_incoming", df[cols])
     con.execute(f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) SELECT {', '.join(cols)} FROM _incoming")
     con.unregister("_incoming")
@@ -122,30 +132,47 @@ def monthly_panel(series=None, start=None, end=None, real=False) -> pd.DataFrame
     """
     Wide monthly DataFrame indexed by date, one column per series_id.
     real=True -> World Bank $ prices divided by US CPI (rebased 2014-16 = 100, like the FAO index).
+                 Uses fred_us_cpi_filled (Oct 2025 gap interpolated) when available.
 
     Under the hood: DuckDB's PIVOT turns (series_id, date, value) into columns.
     """
+    cpi_ids = ["fred_us_cpi_filled", "fred_us_cpi"]
     where = ["1=1"]
     if series:
-        wanted = list(series) + (["fred_us_cpi"] if real and "fred_us_cpi" not in series else [])
+        wanted = list(series) + (cpi_ids if real else [])
         where.append("series_id IN (" + ",".join(f"'{s}'" for s in wanted) + ")")
-    if start:
-        where.append(f"date >= DATE '{start}'")
-    if end:
-        where.append(f"date <= DATE '{end}'")
     with connect(read_only=True) as con:
         df = con.execute(f"""
             PIVOT (SELECT series_id, date, value FROM observations WHERE {' AND '.join(where)})
             ON series_id USING first(value) GROUP BY date ORDER BY date
         """).df()
     df = df.set_index(pd.to_datetime(df.pop("date"))).asfreq("MS")
+    # start/end are applied AFTER deflating: the CPI base years (2014-16) must stay available
     if real:
-        cpi = df["fred_us_cpi"] / df["fred_us_cpi"].loc["2014":"2016"].mean()
-        for c in [c for c in df.columns if c.startswith("wb_")]:
+        cpi_col = next((c for c in cpi_ids if c in df.columns), None)
+        if cpi_col is None:
+            raise ValueError("real=True needs US CPI in the database: run  python src/extract.py fred")
+        cpi = df[cpi_col] / df[cpi_col].loc["2014":"2016"].mean()
+        for c in [c for c in df.columns if c.startswith(("wb_", "ams_", "fut_urea"))]:
             df[c] = df[c] / cpi
-        if series and "fred_us_cpi" not in series:
-            df = df.drop(columns="fred_us_cpi")
-    return df
+        if series:
+            df = df.drop(columns=[c for c in cpi_ids if c in df.columns and c not in series])
+    return df.loc[start:end]
+
+
+def daily(series=None, start=None) -> pd.DataFrame:
+    """Daily terminal data (futures, BDI) as a wide table, for an event study."""
+    where = ["1=1"]
+    if series:
+        where.append("series_id IN (" + ",".join(f"'{s}'" for s in series) + ")")
+    if start:
+        where.append(f"date >= DATE '{start}'")
+    with connect(read_only=True) as con:
+        df = con.execute(f"""
+            PIVOT (SELECT series_id, date, value FROM market_daily WHERE {' AND '.join(where)})
+            ON series_id USING first(value) GROUP BY date ORDER BY date
+        """).df()
+    return df.set_index(pd.to_datetime(df.pop("date")))
 
 
 def trade_flows(hs_code=None) -> pd.DataFrame:
