@@ -106,6 +106,17 @@ WB_SERIES = {
     "sugar, world": ("wb_sugar", "$/kg"),
 }
 
+# Nitrogen fertilizer application rate by crop (kg N per hectare), used by crop_panel.py
+# to build the nitrogen intensity N_c (0 = soybeans, 1 = maize).
+#   series_id: (crop name, kg N/ha)
+# TODO: add the exact source (publication, year, table) of these rates for the thesis.
+CROP_N_RATE = {
+    "wb_maize": ("Maize", 118.8),
+    "wb_rice": ("Rice", 113.8),
+    "wb_wheat_hrw": ("Wheat", 97.8),
+    "wb_soybeans": ("Soybeans", 16.0),   # legume: fixes its own nitrogen -> placebo crop
+}
+
 # ---------------------------------------------------------------------------
 # FRED (St. Louis Fed) — needs FRED_API_KEY
 # ---------------------------------------------------------------------------
