@@ -3,8 +3,8 @@
 Dep. Variable:                   food   R-squared:                       0.211
 Model:                            OLS   Adj. R-squared:                  0.185
 Method:                 Least Squares   F-statistic:                     3.940
-Date:                Mon, 23 Nov 2026   Prob (F-statistic):           4.60e-05
-Time:                        21:56:05   Log-Likelihood:                -697.63
+Date:                Tue, 24 Nov 2026   Prob (F-statistic):           4.60e-05
+Time:                        18:13:14   Log-Likelihood:                -697.63
 No. Observations:                 314   AIC:                             1417.
 Df Residuals:                     303   BIC:                             1459.
 Df Model:                          10                                         
